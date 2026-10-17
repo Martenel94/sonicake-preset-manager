@@ -323,7 +323,8 @@ export class ModuleEditor {
       <div class="knob-control" data-module-id="${moduleId}" data-alg-id="${param.algId}" data-min="${min}" data-max="${max}" data-default="${defaultVal}" data-val="${val}">
         <span class="knob-label" title="Doppio clic o Alt+Clic per ripristinare al centro (ore 12)">${param.name}</span>
         
-        <div class="rotary-knob" data-alg-id="${param.algId}" title="Doppio clic o Alt+Clic per ripristinare al centro (ore 12)">
+        <div class="rotary-knob" data-alg-id="${param.algId}" title="Doppio clic o Alt+Clic per ripristinare al centro (ore 12)"
+             role="slider" tabindex="0" aria-label="${param.name}" aria-valuemin="${min}" aria-valuemax="${max}" aria-valuenow="${val}">
           <svg class="knob-arc-svg" viewBox="0 0 64 64">
             <circle class="knob-track-bg" cx="32" cy="32" r="${radius}" 
                     stroke-dasharray="${circumference}" stroke-dashoffset="${circumference * 0.25}"/>
@@ -439,6 +440,30 @@ export class ModuleEditor {
         val = Math.max(min, Math.min(max, val));
         
         this.updateKnobValue(knobCtrl, val);
+      });
+
+      // Keyboard control (WAI-ARIA slider pattern): arrows +-1, PageUp/PageDown +-10 (Shift+arrow too),
+      // Home/End to the extremes. Mouse and touch behaviour is unchanged.
+      knob.addEventListener('keydown', (e) => {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        const min = parseFloat(knobCtrl.dataset.min);
+        const max = parseFloat(knobCtrl.dataset.max);
+        const current = parseFloat(knobCtrl.dataset.val);
+        const big = e.shiftKey ? 10 : 1;
+        let next;
+        switch (e.key) {
+          case 'ArrowUp':
+          case 'ArrowRight': next = current + big; break;
+          case 'ArrowDown':
+          case 'ArrowLeft': next = current - big; break;
+          case 'PageUp': next = current + 10; break;
+          case 'PageDown': next = current - 10; break;
+          case 'Home': next = min; break;
+          case 'End': next = max; break;
+          default: return;
+        }
+        e.preventDefault();
+        this.updateKnobValue(knobCtrl, Math.max(min, Math.min(max, next)));
       });
 
       // Alt+Click on value display resets to center
@@ -625,6 +650,9 @@ export class ModuleEditor {
       cap.style.transform = `rotate(${angle}deg)`;
     }
 
+    // Keep the accessible value in sync with what the dial shows
+    knobCtrl.querySelector('.rotary-knob')?.setAttribute('aria-valuenow', String(Math.round(value)));
+
     const fillCircle = knobCtrl.querySelector('.knob-track-fill');
     if (fillCircle) {
       const radius = 28;
@@ -711,8 +739,15 @@ export class ModuleEditor {
     const dPath = pathPoints.map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
     const dArea = `${dPath} L ${pathPoints[pathPoints.length - 1].x.toFixed(1)} ${centerY} L ${pathPoints[0].x.toFixed(1)} ${centerY} Z`;
 
+    // Text alternative for assistive tech: the same numbers the dots show
+    const eqSummary = 'Curva di risposta in frequenza. Guadagno per banda: ' + bands.map(b => {
+      const g = (currentParams[b.algId] !== undefined ? currentParams[b.algId] : 0);
+      return `${b.name} ${g > 0 ? '+' : ''}${g}`;
+    }).join(', ');
+
     const gridFreqs = [50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000];
-    const gridDbs = [12, 6, 0, -6, -12];
+    // Ticks share the curve's scale (gain / 50 across the half-height), so labels never contradict the plot
+    const gridDbs = [50, 25, 0, -25, -50];
 
     return `
       <div class="eq-visualizer-card p-3 rounded-xl bg-zinc-950 border border-zinc-800 shadow-inner flex flex-col gap-2">
@@ -724,8 +759,9 @@ export class ModuleEditor {
           <span class="text-[11px] text-zinc-500 font-mono">Trascina i nodi per regolare il guadagno (-50..+50 dB)</span>
         </div>
 
-        <div class="relative w-full overflow-hidden select-none">
-          <svg viewBox="0 0 ${width} ${height}" class="w-full h-auto max-h-48 rounded-lg bg-zinc-900/90 border border-zinc-800/80">
+        <div class="relative w-full overflow-x-auto select-none">
+          <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${eqSummary}" class="w-full min-w-[560px] h-auto max-h-48 rounded-lg bg-zinc-900/90 border border-zinc-800/80">
+            <title>${eqSummary}</title>
             <defs>
               <linearGradient id="eqFillGrad" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.3"/>
@@ -736,11 +772,11 @@ export class ModuleEditor {
 
             <!-- Horizontal dB Grid Lines -->
             ${gridDbs.map(db => {
-              const y = centerY - (db / 15) * (plotH / 2);
+              const y = centerY - (db / 50) * (plotH / 2);
               const isZero = db === 0;
               return `
                 <line x1="${padX}" y1="${y}" x2="${width - padX}" y2="${y}" stroke="${isZero ? '#52525b' : '#27272a'}" stroke-width="${isZero ? '1.5' : '1'}" stroke-dasharray="${isZero ? '' : '3,3'}"/>
-                <text x="${padX - 8}" y="${y + 3}" text-anchor="end" class="text-[9px] fill-zinc-500 font-mono">${db > 0 ? '+' : ''}${db}dB</text>
+                <text x="${padX - 8}" y="${y + 4}" text-anchor="end" class="eq-axis-label">${db > 0 ? '+' : ''}${db}</text>
               `;
             }).join('')}
 
@@ -750,7 +786,7 @@ export class ModuleEditor {
               const label = f >= 1000 ? `${f / 1000}k` : `${f}`;
               return `
                 <line x1="${x}" y1="${padY}" x2="${x}" y2="${height - padY}" stroke="#27272a" stroke-width="1" stroke-dasharray="3,3"/>
-                <text x="${x}" y="${height - padY + 14}" text-anchor="middle" class="text-[9px] fill-zinc-500 font-mono">${label}</text>
+                <text x="${x}" y="${height - padY + 15}" text-anchor="middle" class="eq-axis-label">${label}</text>
               `;
             }).join('')}
 
@@ -769,8 +805,8 @@ export class ModuleEditor {
                 <g class="eq-node-handle cursor-grab active:cursor-grabbing" data-alg-id="${b.algId}" data-band-name="${b.name}" data-cx="${cx}" data-freq="${b.freq}">
                   <circle cx="${cx}" cy="${cy}" r="12" fill="transparent" class="hover:fill-cyan-500/20 transition-all"/>
                   <circle cx="${cx}" cy="${cy}" r="6" fill="#06b6d4" stroke="#ecfeff" stroke-width="2" class="filter drop-shadow"/>
-                  <rect x="${cx - 24}" y="${cy < centerY ? cy - 24 : cy + 10}" width="48" height="15" rx="3" fill="#09090b" fill-opacity="0.8" stroke="#3f3f46" stroke-width="0.5"/>
-                  <text x="${cx}" y="${cy < centerY ? cy - 13 : cy + 21}" text-anchor="middle" class="text-[9px] font-bold font-mono fill-cyan-300">
+                  <rect x="${cx - 24}" y="${cy < centerY ? cy - 26 : cy + 10}" width="48" height="17" rx="3" fill="#09090b" fill-opacity="0.8" stroke="#3f3f46" stroke-width="0.5"/>
+                  <text x="${cx}" y="${cy < centerY ? cy - 13 : cy + 23}" text-anchor="middle" class="eq-node-label">
                     ${gain > 0 ? '+' : ''}${gain}
                   </text>
                 </g>
