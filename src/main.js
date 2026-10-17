@@ -5,6 +5,8 @@
 
 import { connection } from './core/connection.js';
 import { presetEngine } from './core/preset-engine.js';
+import { externalMidi } from './core/external-midi.js';
+import { ExternalMidiModal } from './components/ExternalMidiModal.js';
 
 import { SignalChain } from './components/SignalChain.js';
 import { ModuleEditor } from './components/ModuleEditor.js';
@@ -50,6 +52,7 @@ class App {
     const slotTransferModal = new SlotTransferModal(document.getElementById('slotTransferModalOverlay'));
     const setlistModal = new SetlistModal(document.getElementById('setlistModalOverlay'));
     const backingTrackModal = new BackingTrackModal(document.getElementById('backingTrackModalOverlay'));
+    const extMidiModal = new ExternalMidiModal(document.getElementById('extMidiModalOverlay'));
     const stageModeModal = new StageModeModal(document.getElementById('stageModalOverlay'), tunerModal, setlistModal);
     const toneGenModal = new ToneGeneratorModal(document.getElementById('toneGenModalOverlay'));
     const helpModal = new HelpModal(document.getElementById('helpModalOverlay'));
@@ -69,6 +72,7 @@ class App {
     this.stageModeModal = stageModeModal;
     this.setlistModal = setlistModal;
     this.backingTrackModal = backingTrackModal;
+    this.extMidiModal = extMidiModal;
     this.toneGenModal = toneGenModal;
     this.helpModal = helpModal;
     this.importBundleModal = importBundleModal;
@@ -120,7 +124,21 @@ class App {
     const connMobileStatus = document.getElementById('connMobileStatus');
 
     connection.onStatusChange((status) => {
-      if (status.isConnected) {
+      connLed.classList.toggle('reconnecting', !!status.reconnecting);
+
+      if (status.reconnecting) {
+        // Link dropped: keep the Disconnect button visible so the user can cancel the retries
+        connLed.classList.remove('connected');
+        connText.textContent = `BLE: riconnessione... (${Math.min(status.reconnectAttempt + 1, status.reconnectMaxAttempts)}/${status.reconnectMaxAttempts})`;
+        if (connMobileStatus) {
+          connMobileStatus.textContent = 'BLE…';
+          connMobileStatus.classList.remove('hidden');
+        }
+        btnConnectUsb.style.display = 'none';
+        btnConnectBle.style.display = 'none';
+        btnDisconnect.classList.remove('hidden');
+        btnDisconnect.style.display = 'inline-flex';
+      } else if (status.isConnected) {
         connLed.classList.add('connected');
         connText.textContent = `${status.type.toUpperCase()}: ${status.deviceName}`;
         if (connMobileStatus) {
@@ -146,6 +164,9 @@ class App {
         btnDisconnect.style.display = 'none';
       }
     });
+
+    // Silently re-attach to a previously paired pedal (no picker, no errors if it's off)
+    connection.restoreBleSession();
 
     // 5. Tool Action Buttons
     document.getElementById('btnSyncHardware').addEventListener('click', () => {
@@ -272,6 +293,13 @@ class App {
     document.getElementById('btnOpenBackingTrack')?.addEventListener('click', () => {
       backingTrackModal.open();
     });
+
+    // External MIDI foot controllers (PC / CC -> setlist, presets, A/B)
+    externalMidi.attach({ setlist: setlistModal });
+    document.getElementById('btnOpenExtMidi')?.addEventListener('click', () => {
+      extMidiModal.open();
+    });
+    externalMidi.restore(); // no-op unless the user enabled it in a previous visit
 
     // PWA Install Prompt Handling
     let deferredInstallPrompt = null;
@@ -507,7 +535,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
 // Cleanly release USB MIDI & BLE driver handles on page reload / unload
 window.addEventListener('beforeunload', () => {
-  if (connection && connection.isConnected) {
-    connection.disconnect();
+  if (connection && (connection.isConnected || connection.reconnecting)) {
+    // Keep the paired BLE device id: the next page load can silently re-attach to it
+    connection.disconnect({ forget: false });
   }
 });

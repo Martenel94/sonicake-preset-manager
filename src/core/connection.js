@@ -22,6 +22,31 @@ export class SonicakeConnection {
     this.bleCharacteristic = null;
     this.SERVICE_UUID = '03b80e5a-ede8-4b33-a751-6ce34ec4c700';
     this.CHARACTERISTIC_UUID = '7772e5db-3868-4112-a1a9-f2669d106bf3';
+    this.bleBuffer = [];
+
+    // Link session: incremented on every successful (re)connection. Long-running
+    // operations (flash streaming) capture it and abort if it changes mid-flight,
+    // so a stream is never resumed into a different session.
+    this.sessionId = 0;
+
+    // BLE auto-reconnect
+    this.autoReconnect = true;
+    this.reconnecting = false;
+    this.reconnectAttempt = 0;
+    this.reconnectTimer = null;
+    this.RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000, 15000, 15000, 15000];
+    this.BLE_DEVICE_ID_KEY = 'sonicake_ble_device_id';
+    // Stable references so add/removeEventListener never leak or double-bind
+    this._onBleDisconnected = (event) => this.handleBleDisconnected(event);
+    this._onBleValue = (event) => this.handleBleValue(event);
+
+    if (typeof document !== 'undefined') {
+      // Returning to the tab (or the network coming back) is the best moment to retry now
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.retryReconnectNow();
+      });
+      window.addEventListener('online', () => this.retryReconnectNow());
+    }
 
     // Callbacks
     this.messageHandlers = new Set();
@@ -58,7 +83,10 @@ export class SonicakeConnection {
     const status = {
       isConnected: this.isConnected,
       type: this.connectionType,
-      deviceName: this.deviceName
+      deviceName: this.deviceName,
+      reconnecting: this.reconnecting,
+      reconnectAttempt: this.reconnectAttempt,
+      reconnectMaxAttempts: this.RECONNECT_DELAYS_MS.length
     };
     this.statusHandlers.forEach(handler => handler(status));
   }
@@ -131,6 +159,7 @@ export class SonicakeConnection {
       this.midiInput.onmidimessage = (event) => this.handleUsbMidiMessage(event);
 
       this.isConnected = true;
+      this.sessionId++;
       this.log(`Connected via USB MIDI: ${selected.name}`, 'success');
       this.notifyStatus();
       return true;
@@ -295,58 +324,226 @@ export class SonicakeConnection {
 
       this.log(`Connecting to BLE device: ${this.bleDevice.name}...`, 'info');
 
-      this.bleDevice.addEventListener('gattserverdisconnected', () => {
-        this.log('Bluetooth device disconnected', 'warning');
-        this.disconnect();
-      });
+      // A fresh manual connection replaces any reconnect cycle in progress
+      this.cancelReconnect();
 
-      this.bleServer = await this.bleDevice.gatt.connect();
-      const service = await this.bleServer.getPrimaryService(this.SERVICE_UUID);
-      this.bleCharacteristic = await service.getCharacteristic(this.CHARACTERISTIC_UUID);
+      // Same function reference every time: the browser dedupes, so this never stacks listeners
+      this.bleDevice.addEventListener('gattserverdisconnected', this._onBleDisconnected);
 
-      this.bleBuffer = [];
-      await this.bleCharacteristic.startNotifications();
-      this.bleCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
-        const val = event.target.value;
-        if (!val) return;
-        const data = new Uint8Array(val.buffer, val.byteOffset, val.byteLength);
-        if (data.length === 0) return;
+      await this.openBleSession();
+      this.rememberBleDevice();
 
-        const startsWithSysEx = (data[0] === 0x80 && data[1] === 0x80 && data[2] === 0xF0) || data[0] === 0xF0;
-        const endsWithSysEx = data[data.length - 1] === 0xF7;
-
-        // 1. Single standalone packet
-        if (this.bleBuffer.length === 0 && startsWithSysEx && endsWithSysEx) {
-          let hex = Array.from(data).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-          if (!hex.startsWith('8080')) hex = '8080' + hex;
-          this.dispatchMessage(hex);
-          return;
-        }
-
-        // 2. Fragmented packet - accumulate bytes
-        for (let i = 0; i < data.length; i++) {
-          this.bleBuffer.push(data[i]);
-        }
-
-        // Check if buffer is completed with 0xF7
-        if (this.bleBuffer.length >= 4 && this.bleBuffer[this.bleBuffer.length - 1] === 0xF7) {
-          const buf = new Uint8Array(this.bleBuffer);
-          this.bleBuffer = [];
-          let hex = Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-          if (!hex.startsWith('8080')) hex = '8080' + hex;
-          this.dispatchMessage(hex);
-        }
-      });
-
-      this.connectionType = 'ble';
-      this.deviceName = this.bleDevice.name || 'Sonicake BLE';
-      this.isConnected = true;
       this.log(`Connected via Bluetooth: ${this.deviceName}`, 'success');
       this.notifyStatus();
       return true;
     } catch (err) {
+      // Don't leave a half-attached device behind after a failed first connection
+      if (!this.isConnected && this.bleDevice) {
+        try { this.bleDevice.removeEventListener('gattserverdisconnected', this._onBleDisconnected); } catch (e) {}
+        try { if (this.bleDevice.gatt?.connected) this.bleDevice.gatt.disconnect(); } catch (e) {}
+        this.bleDevice = null;
+      }
       this.log(`Bluetooth connection failed: ${err.message}`, 'error');
       throw err;
+    }
+  }
+
+  /**
+   * Open (or re-open) the GATT session on this.bleDevice and start notifications.
+   * Shared by the first connection and by every reconnect, so the picker is never needed again.
+   */
+  async openBleSession() {
+    const device = this.bleDevice;
+    if (!device) throw new Error('Nessun dispositivo Bluetooth selezionato.');
+
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(this.SERVICE_UUID);
+    const characteristic = await service.getCharacteristic(this.CHARACTERISTIC_UUID);
+
+    // The device may have been released (manual disconnect) while we were awaiting
+    if (this.bleDevice !== device) {
+      try { device.gatt.disconnect(); } catch (e) {}
+      throw new Error('Connessione Bluetooth annullata.');
+    }
+
+    // Drop the listener on the previous characteristic object, if any
+    if (this.bleCharacteristic) {
+      try { this.bleCharacteristic.removeEventListener('characteristicvaluechanged', this._onBleValue); } catch (e) {}
+    }
+
+    // A fragment left over from before a link drop must never be glued to new data
+    this.bleBuffer = [];
+    characteristic.addEventListener('characteristicvaluechanged', this._onBleValue);
+    await characteristic.startNotifications();
+
+    this.bleServer = server;
+    this.bleCharacteristic = characteristic;
+    this.connectionType = 'ble';
+    this.deviceName = device.name || 'Sonicake BLE';
+    this.isConnected = true;
+    this.sessionId++;
+  }
+
+  /**
+   * Incoming BLE notification: normalise to the unified "8080F0...F7" hex form,
+   * reassembling fragments. (event.target.value is a DataView over a shared buffer
+   * on Android Chrome, hence the explicit byteOffset/byteLength slice.)
+   */
+  handleBleValue(event) {
+    const val = event.target.value;
+    if (!val) return;
+    const data = new Uint8Array(val.buffer, val.byteOffset, val.byteLength);
+    if (data.length === 0) return;
+
+    const startsWithSysEx = (data[0] === 0x80 && data[1] === 0x80 && data[2] === 0xF0) || data[0] === 0xF0;
+    const endsWithSysEx = data[data.length - 1] === 0xF7;
+
+    // 1. Single standalone packet
+    if (this.bleBuffer.length === 0 && startsWithSysEx && endsWithSysEx) {
+      let hex = Array.from(data).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+      if (!hex.startsWith('8080')) hex = '8080' + hex;
+      this.dispatchMessage(hex);
+      return;
+    }
+
+    // 2. Fragmented packet - accumulate bytes
+    for (let i = 0; i < data.length; i++) {
+      this.bleBuffer.push(data[i]);
+    }
+
+    // Check if buffer is completed with 0xF7
+    if (this.bleBuffer.length >= 4 && this.bleBuffer[this.bleBuffer.length - 1] === 0xF7) {
+      const buf = new Uint8Array(this.bleBuffer);
+      this.bleBuffer = [];
+      let hex = Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+      if (!hex.startsWith('8080')) hex = '8080' + hex;
+      this.dispatchMessage(hex);
+    }
+  }
+
+  // --- BLE auto-reconnect ---
+
+  rememberBleDevice() {
+    try {
+      if (this.bleDevice?.id) localStorage.setItem(this.BLE_DEVICE_ID_KEY, this.bleDevice.id);
+    } catch (e) {}
+  }
+
+  forgetBleDevice() {
+    try { localStorage.removeItem(this.BLE_DEVICE_ID_KEY); } catch (e) {}
+  }
+
+  /**
+   * The GATT link dropped without the user asking for it (pedal out of range,
+   * power cycle, OS suspended the radio...). Keep the paired device and retry.
+   */
+  handleBleDisconnected(event) {
+    // Ignore echoes of a disconnect we caused ourselves, and events from a stale device
+    if (!this.bleDevice || this.connectionType !== 'ble') return;
+    if (event?.target && event.target !== this.bleDevice) return;
+    // Already handling a drop (a failed reconnect attempt also fires this event)
+    if (this.reconnecting) return;
+
+    this.log('Bluetooth link lost', 'warning');
+    this.isConnected = false;
+    this.bleServer = null;
+    this.bleCharacteristic = null;
+    this.bleBuffer = [];
+
+    if (this.autoReconnect) {
+      this.reconnecting = true;
+      this.reconnectAttempt = 0;
+      this.scheduleReconnect();
+    } else {
+      this.disconnect();
+    }
+  }
+
+  scheduleReconnect() {
+    if (!this.reconnecting || this.reconnectTimer) return;
+
+    if (this.reconnectAttempt >= this.RECONNECT_DELAYS_MS.length) {
+      this.log('Riconnessione Bluetooth non riuscita: premi Bluetooth per ricollegare la pedaliera.', 'error');
+      this.disconnect();
+      return;
+    }
+
+    const delay = this.RECONNECT_DELAYS_MS[this.reconnectAttempt];
+    this.log(`Riconnessione Bluetooth tra ${Math.round(delay / 1000)}s (tentativo ${this.reconnectAttempt + 1}/${this.RECONNECT_DELAYS_MS.length})...`, 'info');
+    this.reconnectTimer = setTimeout(() => this.attemptReconnect(), delay);
+    this.notifyStatus();
+  }
+
+  async attemptReconnect() {
+    this.reconnectTimer = null;
+    if (!this.reconnecting || !this.bleDevice) return;
+
+    this.reconnectAttempt++;
+    this.notifyStatus();
+    try {
+      await this.openBleSession();
+    } catch (err) {
+      // User cancelled (disconnect) while the attempt was in flight
+      if (!this.reconnecting || !this.bleDevice) return;
+      this.log(`Riconnessione fallita: ${err.message}`, 'warning');
+      this.scheduleReconnect();
+      return;
+    }
+
+    this.reconnecting = false;
+    this.reconnectAttempt = 0;
+    this.log(`Bluetooth riconnesso: ${this.deviceName}`, 'success');
+    // isConnected is true again: listeners (main.js) re-run the hardware sync
+    this.notifyStatus();
+  }
+
+  /** Skip the backoff wait and try right now (tab visible again, network back). */
+  retryReconnectNow() {
+    if (!this.reconnecting || !this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.attemptReconnect();
+  }
+
+  cancelReconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnecting = false;
+    this.reconnectAttempt = 0;
+  }
+
+  /**
+   * On page load, silently re-attach to the pedal paired in a previous visit.
+   * Best-effort: needs navigator.bluetooth.getDevices() (not available in every browser),
+   * and the pedal must be on and in range. Never opens a picker or shows an error.
+   * @returns {Promise<boolean>}
+   */
+  async restoreBleSession() {
+    try {
+      if (this.isConnected || this.reconnecting) return false;
+      if (!navigator.bluetooth?.getDevices) return false;
+      const savedId = localStorage.getItem(this.BLE_DEVICE_ID_KEY);
+      if (!savedId) return false;
+
+      const devices = await navigator.bluetooth.getDevices();
+      const device = devices.find(d => d.id === savedId);
+      if (!device) return false;
+
+      this.bleDevice = device;
+      device.addEventListener('gattserverdisconnected', this._onBleDisconnected);
+      await this.openBleSession();
+      this.log(`Bluetooth ripristinato automaticamente: ${this.deviceName}`, 'success');
+      this.notifyStatus();
+      return true;
+    } catch (err) {
+      // Pedal off / out of range / browser refused: stay quiet, the user can press Bluetooth
+      if (!this.isConnected) {
+        try { this.bleDevice?.removeEventListener('gattserverdisconnected', this._onBleDisconnected); } catch (e) {}
+        this.bleDevice = null;
+      }
+      return false;
     }
   }
 
@@ -436,9 +633,13 @@ export class SonicakeConnection {
   }
 
   /**
-   * Disconnect current active device
+   * Disconnect current active device (also cancels any BLE reconnect in progress).
+   * @param {{forget?: boolean}} [options] forget=false keeps the paired BLE device id so the
+   *   next page load can silently re-attach (used when the page is just unloading).
    */
-  disconnect() {
+  disconnect({ forget = true } = {}) {
+    this.cancelReconnect();
+
     if (this.connectionType === 'usb' && this.midiInput) {
       this.midiInput.onmidimessage = null;
       try { this.midiInput.close?.(); } catch (e) {}
@@ -446,11 +647,17 @@ export class SonicakeConnection {
       this.midiInput = null;
       this.midiOutput = null;
     } else if (this.connectionType === 'ble' && this.bleDevice) {
+      // Detach first so our own gatt.disconnect() is not mistaken for a link drop
+      try { this.bleDevice.removeEventListener('gattserverdisconnected', this._onBleDisconnected); } catch (e) {}
+      try { this.bleCharacteristic?.removeEventListener('characteristicvaluechanged', this._onBleValue); } catch (e) {}
       if (this.bleDevice.gatt && this.bleDevice.gatt.connected) {
         this.bleDevice.gatt.disconnect();
       }
       this.bleDevice = null;
+      this.bleServer = null;
       this.bleCharacteristic = null;
+      this.bleBuffer = [];
+      if (forget) this.forgetBleDevice();
     }
 
     this.isConnected = false;

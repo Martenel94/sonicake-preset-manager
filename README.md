@@ -50,6 +50,14 @@ Funziona direttamente dal browser sfruttando gli standard moderni **Web MIDI** e
 - **USB MIDI Diretto:** Connessione stabile via cavo USB Type-C con rilevamento automatico della pedaliera.
 - **Bluetooth BLE Wireless:** Connettiti al modulo Bluetooth nativo della pedaliera per modificare i suoni comodamente senza fili.
 - **Sincronizzazione Bidirezionale:** Ogni rotazione hardware o modifica software viene scambiata istantaneamente con calcolo del checksum di controllo (*SMBus PEC CRC8*).
+- **Riconnessione Automatica BLE:** se il collegamento cade (pedaliera fuori portata, spenta e riaccesa) l'app riprova da sola con attese crescenti (1s → 15s, max 8 tentativi) **senza riaprire il selettore Bluetooth**, e risincronizza i preset appena torna il link. Al ricaricamento della pagina tenta in silenzio di riagganciare l'ultima pedaliera accoppiata (dove il browser supporta `navigator.bluetooth.getDevices()`).
+- **Scrittura Flash a prova di interruzione:** lo streaming di NAM/IR è tutto-o-niente. Se un pacchetto non parte, o il link cade e si riconnette durante l'upload, la scrittura si interrompe con un errore chiaro invece di segnare lo slot come scritto e di riprendere a metà in una nuova sessione.
+
+### 🦶 4b. Controller MIDI Esterno (Chocolate MIDI, Airstep, ...)
+Da **Strumenti → Controller MIDI Esterno** puoi comandare l'app con un pedale MIDI USB o Bluetooth:
+- **Program Change** → seleziona il brano N+1 della scaletta attiva (che carica il preset collegato) oppure direttamente il preset N+1 (PC 0-99).
+- **Control Change** → brano/preset precedente e successivo, alterna Tone A/B. I tasti si assegnano con **MIDI learn** (premi *Impara* e poi il tasto del controller). Predefiniti: CC 80/81 brano prec./succ., CC 82/83 preset prec./succ., CC 85 A/B.
+- Filtro per canale MIDI (o omni), monitor dei messaggi in tempo reale, ascolto senza permesso SysEx, porta della Smart Box esclusa automaticamente.
 
 ### 💾 5. Gestione Completa dei 100 Preset Hardware
 - **50 Slot Utente (U01–U50):** Rinomina, modifica e salva i tuoi suoni con protezione da sovrascritture accidentali.
@@ -112,6 +120,12 @@ Apri `http://localhost:5173` nel tuo browser.
 npm run build
 ```
 La cartella `dist/` conterrà i file pronti per essere distribuiti su GitHub Pages, Vercel, Netlify o qualsiasi server web statico.
+
+### Test automatici
+```bash
+npm test
+```
+Esegue (con `node:test`, nessuna dipendenza aggiuntiva e senza hardware) i test di riconnessione BLE, integrità dello streaming in Flash e controller MIDI esterno, usando dispositivi Bluetooth/MIDI simulati.
 
 ---
 

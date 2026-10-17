@@ -1463,6 +1463,52 @@ export class PresetEngine {
   // --- Hardware Flash Memory Streaming ---
 
   /**
+   * Stream pre-built flash packets to the pedal with the verified hardware timing
+   * (>= 8ms between packets, 1.2s settle after the last one).
+   *
+   * Integrity rules: the stream is all-or-nothing. If a packet cannot be sent, or the link
+   * session changes (drop + auto-reconnect), it aborts with an error instead of carrying on
+   * and reporting success on a partial upload, and it never resumes into a new session.
+   * @param {Uint8Array[]} packets
+   * @param {string} label Human readable target, used in error messages
+   * @param {Function} onProgress (current, total, percent)
+   */
+  async streamFlashPackets(packets, label, onProgress = () => {}) {
+    const total = packets.length;
+    const session = connection.sessionId;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const MAX_SEND_ATTEMPTS = 3;
+
+    const assertLinkAlive = (detail) => {
+      if (!connection.isConnected || connection.sessionId !== session) {
+        throw new Error(`Connessione con la pedaliera persa durante la scrittura di ${label} (${detail}). Scrittura interrotta: controlla la connessione e ripeti l'operazione.`);
+      }
+    };
+
+    for (let i = 0; i < total; i++) {
+      let sent = false;
+      for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS && !sent; attempt++) {
+        assertLinkAlive(`pacchetto ${i + 1}/${total}`);
+        sent = await connection.writeRawBytes(packets[i]);
+        if (!sent) await sleep(20); // e.g. BLE "GATT operation already in progress"
+      }
+      if (!sent) {
+        throw new Error(`Invio del pacchetto ${i + 1}/${total} non riuscito durante la scrittura di ${label}. Scrittura interrotta: ripeti l'operazione.`);
+      }
+
+      const percent = Math.round(((i + 1) / total) * 100);
+      onProgress(i + 1, total, percent);
+      // Transmission rate throttle (8ms safe interval aligns with captured official Sonicake engine rate;
+      // prevents DMA FIFO overrun on the pedal MCU)
+      await sleep(8);
+    }
+
+    // Wait for flash sector write completion (as observed in hardware capture: ~1.2s)
+    await sleep(1200);
+    assertLinkAlive('conferma finale');
+  }
+
+  /**
    * Flash a User IR (.wav) directly into pedalboard persistent flash memory (Slot 1 to 5)
    * Streams 112 chunked SysEx packets with CRC8 directly over Web MIDI / BLE.
    * @param {number} slotIndex 0 to 4 (representing User IR 1 to 5)
@@ -1490,18 +1536,9 @@ export class PresetEngine {
 
     connection.log(`Inizio scrittura Flash: User IR ${slotIndex + 1} ("${name}") - ${total} pacchetti SysEx...`, 'info');
 
-    for (let i = 0; i < total; i++) {
-      await connection.writeRawBytes(packets[i]);
-      const percent = Math.round(((i + 1) / total) * 100);
-      onProgress(i + 1, total, percent);
-      // Transmission rate throttle (8ms safe interval aligns with captured official Sonicake engine rate)
-      await new Promise(r => setTimeout(r, 8));
-    }
+    await this.streamFlashPackets(packets, `User IR ${slotIndex + 1}`, onProgress);
 
-    // Wait for flash sector write completion (as observed in hardware capture: ~1.2s)
-    await new Promise(r => setTimeout(r, 1200));
-
-    // Update local name and persist metadata
+    // Update local name and persist metadata (only reached if the whole stream was delivered)
     this.replaceUserIR(slotIndex, name, false);
 
     // Refresh pedalboard slot names (both IR and Clone names)
@@ -1544,18 +1581,9 @@ export class PresetEngine {
       await new Promise(r => setTimeout(r, 60));
     } catch (_) {}
 
-    for (let i = 0; i < total; i++) {
-      await connection.writeRawBytes(packets[i]);
-      const percent = Math.round(((i + 1) / total) * 100);
-      onProgress(i + 1, total, percent);
-      // Safe 8ms interval prevents DMA FIFO overrun on pedal MCU
-      await new Promise(r => setTimeout(r, 8));
-    }
+    await this.streamFlashPackets(packets, `Clone AMP ${slotIndex + 1}`, onProgress);
 
-    // Wait for flash sector write completion (as observed in hardware capture: ~1.2s)
-    await new Promise(r => setTimeout(r, 1200));
-
-    // Update local name and persist metadata
+    // Update local name and persist metadata (only reached if the whole stream was delivered)
     this.replaceCloneProfile(slotIndex, name, false);
 
     // Refresh pedalboard slot names (both IR and Clone names)

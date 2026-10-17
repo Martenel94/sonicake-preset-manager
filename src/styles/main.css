@@ -161,6 +161,22 @@ body {
   box-shadow: 0 0 8px var(--led-green-glow);
 }
 
+/* BLE link dropped, auto-reconnect in progress */
+.conn-led.reconnecting {
+  background: #f59e0b;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.7);
+  animation: conn-led-blink 1s ease-in-out infinite;
+}
+
+@keyframes conn-led-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conn-led.reconnecting { animation: none; }
+}
+
 .conn-text {
   font-weight: 600;
   color: var(--text-muted);
